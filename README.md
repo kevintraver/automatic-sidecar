@@ -54,7 +54,7 @@ An iPad drops off USB and comes back while it enumerates, so every change waits 
 
 ### After a restart
 
-If the iPad stays plugged in while the Mac restarts, macOS doesn't list it as a USB device until it's replugged, so no plug-in event arrives. So when the agent starts within 5 minutes of boot and no iPad has appeared on USB after 30 seconds, it starts Sidecar anyway. Sidecar still finds the iPad and, in testing, ran the session over the cable (`link type Direct`). Because macOS never registered the iPad on USB, unplugging it after this kind of start isn't detected; replug once or turn Sidecar off from Control Center.
+If the iPad stays plugged in while the Mac restarts, macOS doesn't list it as a USB device until it's replugged, so no plug-in event arrives. The Mac's USB-C port controller still knows what's attached, though: from USB Power Delivery, the port reports the partner's maker string (`SOPMfgString = "iPad"`). So when the agent starts within 5 minutes of boot and, 5 seconds later, no iPad is on USB but a USB-C port reports one, it starts Sidecar anyway. In testing the session still ran over the cable (`link type Direct`). Because macOS never registered the iPad on USB, unplugging it after this kind of start isn't detected; replug once or turn Sidecar off from Control Center.
 
 ### Starting and stopping Sidecar
 

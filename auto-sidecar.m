@@ -247,17 +247,35 @@ static void usbDeviceRemoved(void *refcon, io_iterator_t iterator) {
     usbChanged();
 }
 
+// The USB-C port controller reads the identity of what's plugged in (from USB Power Delivery), even when
+// macOS hasn't registered the device on USB.
+static BOOL iPadOnUSBCPort(void) {
+    io_iterator_t iterator;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccessoryManager"), &iterator) != KERN_SUCCESS) return NO;
+    BOOL found = NO;
+    io_service_t port;
+    while ((port = IOIteratorNext(iterator))) {
+        id maker = CFBridgingRelease(IORegistryEntryCreateCFProperty(port, CFSTR("SOPMfgString"), kCFAllocatorDefault, 0));
+        id active = CFBridgingRelease(IORegistryEntryCreateCFProperty(port, CFSTR("ConnectionActive"), kCFAllocatorDefault, 0));
+        if ([active isEqual:@YES] && [maker isKindOfClass:NSString.class] && [maker hasPrefix:@"iPad"]) found = YES;
+        IOObjectRelease(port);
+    }
+    IOObjectRelease(iterator);
+    return found;
+}
+
 // After a restart, macOS doesn't register an iPad that stayed plugged in as a USB device until it's
-// replugged, so no plug-in event ever arrives. Shortly after boot, if no iPad has shown up on USB and
-// nothing has changed, start Sidecar anyway; it connects wirelessly.
-static const double kAfterBootWaitSeconds = 30;
+// replugged, so no plug-in event ever arrives. Shortly after boot, if nothing has shown up on USB but a
+// USB-C port reports an iPad, start Sidecar anyway; it still runs over the cable.
+static const double kAfterBootWaitSeconds = 5;
 static const double kAfterBootWindowSeconds = 300;
 static void startAfterBootFallback(void) {
     if (NSProcessInfo.processInfo.systemUptime > kAfterBootWindowSeconds) return;
     NSUInteger startGeneration = generation;
     after(kAfterBootWaitSeconds, ^{
         if (generation != startGeneration || iPadOnUSB() || manager().connectedDevices.count > 0) return;
-        NSLog(@"No iPad on USB since boot; starting Sidecar wirelessly");
+        if (!iPadOnUSBCPort()) return;
+        NSLog(@"iPad on a USB-C port but not on USB since boot; starting Sidecar");
         connectSidecar(30, ^BOOL { return generation == startGeneration; }, ^(BOOL ok) {});
     });
 }
