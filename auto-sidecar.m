@@ -1,6 +1,6 @@
-// auto-sidecar: start Sidecar when an iPad is plugged in over USB, and stop it when unplugged.
+// auto-sidecar: start Sidecar when an iPad is plugged in over USB-C, and stop it when unplugged.
 //
-//   auto-sidecar               watch for USB iPads and connect/disconnect Sidecar (run by the LaunchAgent)
+//   auto-sidecar               watch for an iPad on a USB-C port and connect/disconnect Sidecar (run by the LaunchAgent)
 //   auto-sidecar connect       connect Sidecar once and exit
 //   auto-sidecar disconnect    disconnect Sidecar once and exit
 //   auto-sidecar list          list Sidecar-capable devices
@@ -9,12 +9,13 @@
 
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
-#import <IOKit/usb/IOUSBLib.h>
 #include <dlfcn.h>
+#include <notify.h>
 
 @interface SidecarDevice : NSObject
 @property (readonly) NSString *name;
 @property (readonly) NSUUID *identifier;
+@property (readonly) unsigned long long status;
 @end
 
 @interface SidecarDisplayManager : NSObject
@@ -25,9 +26,9 @@
 - (void)disconnectFromDevice:(SidecarDevice *)device completion:(void (^)(NSError *))completion;
 @end
 
-typedef BOOL (^StillWanted)(void);
-static void usbChanged(void);
-static void stopPortWatch(void);
+// SidecarDevice.status is Rapport's device-flag word; this bit means the device is reachable over USB
+// (SidecarRelay names it "USB"). Sidecar only runs a session over the cable once it's set.
+static const unsigned long long kSidecarStatusUSB = 0x1000000;
 
 static SidecarDisplayManager *manager(void) {
     return [NSClassFromString(@"SidecarDisplayManager") sharedManager];
@@ -43,51 +44,6 @@ static SidecarDevice *targetDevice(void) {
 
 static void after(double seconds, dispatch_block_t block) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), block);
-}
-
-// The iPad can take a moment to show up in Sidecar's device list, and a connect can fail while USB
-// is still settling, so retry until it works, attempts run out, or the connection is no longer wanted.
-static void connectSidecar(int attemptsLeft, StillWanted stillWanted, void (^done)(BOOL ok)) {
-    if (!stillWanted()) {
-        done(NO);
-        return;
-    }
-    if (manager().connectedDevices.count > 0) {
-        NSLog(@"Sidecar already connected");
-        done(YES);
-        return;
-    }
-    void (^retry)(void) = ^{
-        if (attemptsLeft <= 1) {
-            NSLog(@"Giving up on connecting Sidecar");
-            done(NO);
-            return;
-        }
-        after(1, ^{ connectSidecar(attemptsLeft - 1, stillWanted, done); });
-    };
-    SidecarDevice *device = targetDevice();
-    if (!device) {
-        retry();
-        return;
-    }
-    NSLog(@"Connecting Sidecar to %@", device.name);
-    [manager() connectToDevice:device completion:^(NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (error) {
-                NSLog(@"Sidecar connect failed: %@", error.localizedDescription);
-                retry();
-                return;
-            }
-            NSLog(@"Sidecar connected to %@", device.name);
-            if (!stillWanted()) {
-                // USB changed while connecting (e.g. unplugged mid-connect), and the newer state's handling
-                // may have already run and found nothing to disconnect. Re-evaluate now that we're connected.
-                NSLog(@"USB changed while connecting; checking again");
-                usbChanged();
-            }
-            done(YES);
-        });
-    }];
 }
 
 static void disconnectSidecar(void (^done)(void)) {
@@ -109,149 +65,9 @@ static void disconnectSidecar(void (^done)(void)) {
     }
 }
 
-static NSDictionary *appleUSBMatch(void) {
-    NSMutableDictionary *match = (__bridge_transfer NSMutableDictionary *)IOServiceMatching("IOUSBHostDevice");
-    match[@kIOPropertyMatchKey] = @{@kUSBVendorID: @(kAppleVendorID)};
-    return match;
-}
-
-static BOOL drainIPads(io_iterator_t iterator) {
-    BOOL sawIPad = NO;
-    io_service_t service;
-    while ((service = IOIteratorNext(iterator))) {
-        CFStringRef product = IORegistryEntryCreateCFProperty(service, CFSTR(kUSBProductString), kCFAllocatorDefault, 0);
-        if (product) {
-            if ([(__bridge NSString *)product hasPrefix:@"iPad"]) sawIPad = YES;
-            CFRelease(product);
-        }
-        IOObjectRelease(service);
-    }
-    return sawIPad;
-}
-
-static BOOL iPadOnUSB(void) {
-    io_iterator_t iterator;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault, (__bridge_retained CFDictionaryRef)appleUSBMatch(), &iterator) != KERN_SUCCESS) return NO;
-    BOOL present = drainIPads(iterator);
-    IOObjectRelease(iterator);
-    return present;
-}
-
-// Sidecar logs "Data link type changed <old> -> <new>" when its session moves to another link. After an
-// unplug, a change to a wireless link (AWDL) means a disconnect can now reach the iPad. Only watched
-// briefly around an unplug.
-static NSTask *linkWatch = nil;
-static BOOL sawWirelessLink = NO;
-static void (^onWirelessLink)(void) = nil;
-
-static void stopLinkWatch(void) {
-    [linkWatch terminate];
-    linkWatch = nil;
-}
-
-// Called on every unplug. A watch can still be running from an earlier unplug (after a quick replug),
-// so forget any wireless move seen before this unplug.
-static void startLinkWatch(void) {
-    sawWirelessLink = NO;
-    if (linkWatch.running) return;
-    NSTask *task = [NSTask new];
-    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/log"];
-    task.arguments = @[@"stream", @"--style", @"compact", @"--predicate",
-                       @"process == \"SidecarRelay\" AND eventMessage CONTAINS \"Data link type changed\""];
-    NSPipe *pipe = [NSPipe pipe];
-    task.standardOutput = pipe;
-    task.standardError = [NSFileHandle fileHandleWithNullDevice];
-    pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
-        NSData *data = handle.availableData;
-        if (data.length == 0) {  // EOF: the stream was stopped. Clear the handler (else it fires forever) and close the pipe (else its fd leaks).
-            handle.readabilityHandler = nil;
-            [handle closeFile];
-            return;
-        }
-        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        for (NSString *line in [output componentsSeparatedByString:@"\n"]) {
-            NSRange arrow = [line rangeOfString:@"Data link type changed "];
-            if (arrow.location == NSNotFound) continue;
-            NSString *link = [[line componentsSeparatedByString:@"-> "].lastObject
-                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-            if ([link isEqualToString:@"Direct"] || [link isEqualToString:@"Unknown"]) continue;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (task != linkWatch) return;
-                NSLog(@"Sidecar moved to %@", link);
-                sawWirelessLink = YES;
-                if (onWirelessLink) onWirelessLink();
-            });
-        }
-    };
-    NSError *error;
-    if (![task launchAndReturnError:&error]) {
-        NSLog(@"Could not start log stream: %@", error.localizedDescription);
-        return;
-    }
-    linkWatch = task;
-}
-
-// Each USB change bumps the generation, so work started for an older state stops on its own.
-static NSUInteger generation = 0;
-
-// The iPad drops off USB and comes back while it enumerates, so wait for USB to settle,
-// then make Sidecar match whether an iPad is plugged in.
-//
-// On unplug, a disconnect sent right away goes to the dead USB link and never reaches the iPad, which
-// then sits on "Connection lost". Within a few seconds Sidecar's video stream times out and the session
-// reconnects over wireless (AWDL), so wait for that and disconnect over it; the iPad then sleeps cleanly.
-// If the move to wireless isn't seen in the log, disconnect after a fixed wait instead.
-static const double kSettleSeconds = 2;
-static const double kAfterWirelessSeconds = 0.5;
-static const double kFallbackSeconds = 8;
-static void usbChanged(void) {
-    NSUInteger current = ++generation;
-    after(kSettleSeconds, ^{
-        if (current != generation) return;
-        BOOL pluggedIn = iPadOnUSB();
-        StillWanted stillWanted = ^BOOL { return current == generation; };
-        if (pluggedIn) {
-            stopLinkWatch();
-            onWirelessLink = nil;
-            NSLog(@"iPad plugged in");
-            connectSidecar(20, stillWanted, ^(BOOL ok) {});
-            return;
-        }
-        NSLog(@"iPad unplugged; disconnecting Sidecar once it has moved to wireless");
-        __block BOOL finished = NO;
-        void (^finish)(void) = ^{
-            if (finished || !stillWanted()) return;
-            finished = YES;
-            onWirelessLink = nil;
-            stopLinkWatch();
-            disconnectSidecar(^{});
-        };
-        if (sawWirelessLink) {
-            after(kAfterWirelessSeconds, finish);
-        } else {
-            onWirelessLink = ^{ after(kAfterWirelessSeconds, finish); };
-            after(kFallbackSeconds, ^{
-                if (!finished && stillWanted()) NSLog(@"Did not see Sidecar move to wireless; disconnecting anyway");
-                finish();
-            });
-        }
-    });
-}
-
-static void usbDeviceAdded(void *refcon, io_iterator_t iterator) {
-    if (!drainIPads(iterator)) return;
-    stopPortWatch();  // the iPad is on USB now, so USB events cover it
-    usbChanged();
-}
-
-static void usbDeviceRemoved(void *refcon, io_iterator_t iterator) {
-    if (!drainIPads(iterator)) return;
-    startLinkWatch();  // start now: the move to wireless can happen before USB has settled
-    usbChanged();
-}
-
-// The USB-C port controller reads the identity of what's plugged in (from USB Power Delivery), even when
-// macOS hasn't registered the device on USB.
+// The USB-C port controller reads the identity of what's plugged in over USB Power Delivery. Unlike the
+// USB device list, this doesn't flap while the iPad enumerates, and it still works after a restart, when
+// macOS doesn't register an iPad that stayed plugged in as a USB device.
 static BOOL iPadOnUSBCPort(void) {
     io_iterator_t iterator;
     if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccessoryManager"), &iterator) != KERN_SUCCESS) return NO;
@@ -267,72 +83,193 @@ static BOOL iPadOnUSBCPort(void) {
     return found;
 }
 
-// After a restart, macOS doesn't register an iPad that stayed plugged in as a USB device until it's
-// replugged, so neither plug-in nor unplug events arrive for it. Shortly after startup, if nothing is on
-// USB but a USB-C port reports an iPad: start Sidecar if the Mac just booted (it still runs over the
-// cable), and while Sidecar is on, poll the port so an unplug still ends the session cleanly.
-static const double kHiddenIPadWaitSeconds = 5;
-static const double kAfterBootWindowSeconds = 300;
-static dispatch_source_t portWatch = nil;
-
-static void stopPortWatch(void) {
-    if (!portWatch) return;
-    dispatch_source_cancel(portWatch);
-    portWatch = nil;
-}
-
-static void startPortWatch(void) {
-    stopPortWatch();
-    portWatch = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(portWatch, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 4);
-    dispatch_source_set_event_handler(portWatch, ^{
-        if (iPadOnUSBCPort()) return;
-        stopPortWatch();
-        NSLog(@"iPad left its USB-C port");
-        startLinkWatch();
-        usbChanged();
-    });
-    dispatch_resume(portWatch);
-}
-
-static void handleIPadHiddenFromUSB(void) {
-    BOOL justBooted = NSProcessInfo.processInfo.systemUptime <= kAfterBootWindowSeconds;
-    NSUInteger startGeneration = generation;
-    after(kHiddenIPadWaitSeconds, ^{
-        if (generation != startGeneration || iPadOnUSB() || !iPadOnUSBCPort()) return;
-        if (manager().connectedDevices.count > 0) {
-            NSLog(@"iPad on a USB-C port but not on USB; watching the port for an unplug");
-            startPortWatch();
+// After an unplug, Sidecar's session is stuck on the dead USB link, and a disconnect sent on it never
+// reaches the iPad, which then sits on "Connection lost". Within a few seconds Sidecar's video stream times
+// out and it reconnects over wireless (AWDL): SidecarDisplayAgent logs "=== Sidecar Connected ... [AWDL] ===",
+// then "AVCVideoStream-didStart" once video is flowing to the iPad again. A disconnect sent before video
+// restarts still leaves "Connection lost" on screen for a few seconds; one sent after it puts the iPad
+// straight to sleep. If the iPad is gone entirely (for example, unplugged while the Mac slept), the
+// reconnect fails instead and Sidecar logs "Reconnect Failed". Watch for these, briefly.
+// Runs `log stream` with a predicate, stores it in *slot, and hands each real entry (not log stream's own
+// header, which repeats the predicate) to the handler on the main queue while *slot still holds it.
+static void startLogWatch(NSTask *__strong *slot, NSString *process, NSString *predicate, void (^onLine)(NSString *line)) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/log"];
+    task.arguments = @[@"stream", @"--style", @"compact", @"--predicate",
+                       [NSString stringWithFormat:@"process == \"%@\" AND (%@)", process, predicate]];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+    NSString *entryMarker = [process stringByAppendingString:@"["];  // compact entries read "... process[pid:tid] ..."
+    pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+        NSData *data = handle.availableData;
+        if (data.length == 0) {  // EOF: the stream was stopped. Clear the handler (else it fires forever) and close the pipe (else its fd leaks).
+            handle.readabilityHandler = nil;
+            [handle closeFile];
             return;
         }
-        if (!justBooted) return;
-        NSLog(@"iPad on a USB-C port but not on USB since boot; starting Sidecar");
-        connectSidecar(30, ^BOOL { return generation == startGeneration; }, ^(BOOL ok) {
-            if (ok) startPortWatch();
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        for (NSString *line in [output componentsSeparatedByString:@"\n"]) {
+            if (![line containsString:entryMarker]) continue;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (*slot == task) onLine(line);
+            });
+        }
+    };
+    NSError *error;
+    if (![task launchAndReturnError:&error]) {
+        NSLog(@"Could not start log stream: %@", error.localizedDescription);
+        return;
+    }
+    *slot = task;
+}
+
+static NSTask *sessionWatch = nil;    // during an unplug: is the session back on wireless?
+static NSTask *directLinkWatch = nil; // during a plug-in: has rapportd found the iPad over the cable?
+
+static void stopSessionWatch(void) {
+    [sessionWatch terminate];
+    sessionWatch = nil;
+}
+
+static void stopDirectLinkWatch(void) {
+    [directLinkWatch terminate];
+    directLinkWatch = nil;
+}
+
+static void startSessionWatch(void (^onReady)(NSString *reason)) {
+    stopSessionWatch();
+    __block BOOL onWireless = NO;
+    startLogWatch(&sessionWatch, @"SidecarDisplayAgent",
+        @"eventMessage CONTAINS \"=== Sidecar Connected\" OR eventMessage CONTAINS \"AVCVideoStream-didStart\" OR "
+         "eventMessage CONTAINS \"Reconnect Failed\"",
+        ^(NSString *line) {
+            if ([line containsString:@"Reconnect Failed"]) onReady(@"Sidecar could not reconnect");
+            else if ([line containsString:@"=== Sidecar Connected"]) onWireless = ![line containsString:@"[Direct]"];
+            else if (onWireless && [line containsString:@"AVCVideoStream-didStart"]) onReady(@"Sidecar moved to wireless");
         });
-    });
+}
+
+static BOOL pluggedIn = NO;     // an iPad is on a USB-C port
+static BOOL wantConnect = NO;   // plugged in, and Sidecar not yet started for this plug-in
+static BOOL connecting = NO;
+static BOOL directLinkUp = NO;  // rapportd has found the iPad over the cable since it was plugged in
+static int connectFailures = 0;
+static const int kMaxConnectFailures = 3;
+static NSUInteger unplugGeneration = 0;  // bumped to cancel a pending unplug
+static const double kUnplugFallbackSeconds = 10;  // if neither log line shows up
+
+static void handleUnplug(void);
+
+// Connect once the iPad is reachable over the cable: rapportd logs "Bonjour device changed ... DirectLink"
+// when it finds the iPad on the cable's network link. Sidecar's own USB flag says the same, but SidecarRelay
+// publishes it to clients several seconds late. Called on plug-in, on that log line, and on every change to
+// Sidecar's device list, so there's nothing to poll or retry on a timer.
+static void tryConnect(void) {
+    if (!wantConnect || connecting) return;
+    if (manager().connectedDevices.count > 0) {
+        NSLog(@"Sidecar already connected");
+        wantConnect = NO;
+        stopDirectLinkWatch();
+        return;
+    }
+    SidecarDevice *device = targetDevice();
+    if (!device || !(directLinkUp || (device.status & kSidecarStatusUSB))) return;  // not ready; a later event calls again
+    connecting = YES;
+    NSLog(@"Connecting Sidecar to %@", device.name);
+    [manager() connectToDevice:device completion:^(NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            connecting = NO;
+            if (error) {
+                NSLog(@"Sidecar connect failed: %@", error.localizedDescription);
+                if (++connectFailures >= kMaxConnectFailures) {
+                    NSLog(@"Giving up on connecting Sidecar");
+                    wantConnect = NO;
+                    stopDirectLinkWatch();
+                }
+                return;  // tried again on the next device change
+            }
+            NSLog(@"Sidecar connected to %@", device.name);
+            wantConnect = NO;
+            stopDirectLinkWatch();
+            if (!pluggedIn) handleUnplug();  // unplugged while connecting
+        });
+    }];
+}
+
+static void handleUnplug(void) {
+    NSUInteger mine = ++unplugGeneration;
+    if (connecting) return;  // the connect's completion handles it
+    if (manager().connectedDevices.count == 0) return;
+    void (^finish)(NSString *) = ^(NSString *reason) {
+        if (mine != unplugGeneration) return;
+        ++unplugGeneration;
+        NSLog(@"%@; disconnecting", reason);
+        stopSessionWatch();
+        disconnectSidecar(^{});
+    };
+    startSessionWatch(finish);
+    after(kUnplugFallbackSeconds, ^{ finish(@"Did not see Sidecar move to wireless"); });
+}
+
+static void portsChanged(void) {
+    BOOL now = iPadOnUSBCPort();
+    if (now == pluggedIn) return;
+    pluggedIn = now;
+    if (now) {
+        NSLog(@"iPad plugged in");
+        ++unplugGeneration;
+        stopSessionWatch();
+        wantConnect = YES;
+        connectFailures = 0;
+        directLinkUp = NO;
+        stopDirectLinkWatch();
+        startLogWatch(&directLinkWatch, @"rapportd",
+            @"eventMessage BEGINSWITH \"Bonjour device\" AND eventMessage CONTAINS \"DirectLink\"",
+            ^(NSString *line) {
+                directLinkUp = ![line containsString:@"Bonjour device lost"];
+                tryConnect();
+            });
+        tryConnect();
+    } else {
+        NSLog(@"iPad unplugged; disconnecting Sidecar once it has moved to wireless");
+        wantConnect = NO;
+        stopDirectLinkWatch();
+        handleUnplug();
+    }
+}
+
+static void portMessage(void *refcon, io_service_t service, natural_t messageType, void *argument) {
+    portsChanged();
 }
 
 static int watch(void) {
-    IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault);
-    CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
-
-    io_iterator_t added, removed;
-    kern_return_t kr = IOServiceAddMatchingNotification(port, kIOFirstMatchNotification,
-        (__bridge_retained CFDictionaryRef)appleUSBMatch(), usbDeviceAdded, NULL, &added);
-    if (kr == KERN_SUCCESS) {
-        kr = IOServiceAddMatchingNotification(port, kIOTerminatedNotification,
-            (__bridge_retained CFDictionaryRef)appleUSBMatch(), usbDeviceRemoved, NULL, &removed);
-    }
+    // The kernel sends a general-interest message on a USB-C port whenever its properties change,
+    // including ConnectionActive on plug-in and unplug.
+    IONotificationPortRef notifyPort = IONotificationPortCreate(kIOMainPortDefault);
+    CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(notifyPort), kCFRunLoopDefaultMode);
+    io_iterator_t ports;
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccessoryManager"), &ports);
     if (kr != KERN_SUCCESS) {
-        NSLog(@"IOServiceAddMatchingNotification failed: 0x%x", kr);
+        NSLog(@"Could not list USB-C ports: 0x%x", kr);
         return 1;
     }
-    // Drain existing matches to arm the notifications; this also connects if an iPad is already plugged in.
-    usbDeviceAdded(NULL, added);
-    drainIPads(removed);
-    NSLog(@"Watching for USB iPads");
-    handleIPadHiddenFromUSB();
+    io_service_t port;
+    while ((port = IOIteratorNext(ports))) {
+        io_object_t notification;
+        kr = IOServiceAddInterestNotification(notifyPort, port, kIOGeneralInterest, portMessage, NULL, &notification);
+        if (kr != KERN_SUCCESS) NSLog(@"Could not watch a USB-C port: 0x%x", kr);
+        IOObjectRelease(port);
+    }
+    IOObjectRelease(ports);
+
+    // SidecarRelay bumps this whenever a device's status changes, such as the iPad becoming reachable over USB.
+    NSString *deviceGeneration = [NSString stringWithFormat:@"user.uid.%d.com.apple.sidecar-relay.device-generation", getuid()];
+    int token;
+    notify_register_dispatch(deviceGeneration.UTF8String, &token, dispatch_get_main_queue(), ^(int t) { tryConnect(); });
+
+    NSLog(@"Watching for an iPad on USB-C");
+    portsChanged();  // an iPad already plugged in, including after a restart
     // Drain a pool per pass: objects Foundation autoreleases on the main thread (such as each stopped
     // log stream's NSTask and pipe) would otherwise pile up in main's pool, which never drains.
     for (;;) @autoreleasepool {
@@ -351,12 +288,21 @@ int main(int argc, const char *argv[]) {
         if ([command isEqualToString:@"list"]) {
             NSArray *connected = manager().connectedDevices;
             for (SidecarDevice *d in manager().devices) {
-                printf("%s%s\n", d.name.UTF8String, [connected containsObject:d] ? " (connected)" : "");
+                printf("%s%s%s\n", d.name.UTF8String, (d.status & kSidecarStatusUSB) ? " (USB)" : "",
+                       [connected containsObject:d] ? " (connected)" : "");
             }
             return 0;
         }
         if ([command isEqualToString:@"connect"]) {
-            connectSidecar(10, ^BOOL { return YES; }, ^(BOOL ok) { exit(ok ? 0 : 1); });
+            SidecarDevice *device = targetDevice();
+            if (!device) {
+                fprintf(stderr, "No Sidecar device found\n");
+                return 1;
+            }
+            [manager() connectToDevice:device completion:^(NSError *error) {
+                if (error) NSLog(@"Sidecar connect failed: %@", error.localizedDescription);
+                exit(error ? 1 : 0);
+            }];
             CFRunLoopRun();
             return 1;
         }

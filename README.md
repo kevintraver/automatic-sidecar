@@ -19,7 +19,7 @@ cd automatic-sidecar
 ./install.sh
 ```
 
-This compiles `auto-sidecar` to `~/.local/bin/auto-sidecar` and installs a LaunchAgent (`com.kevintraver.auto-sidecar`) that runs it at login. Plug in your iPad and it becomes a display within a few seconds. Unplug it and, about 4 seconds later, Sidecar ends and the iPad goes to sleep.
+This compiles `auto-sidecar` to `~/.local/bin/auto-sidecar` and installs a LaunchAgent (`com.kevintraver.auto-sidecar`) that runs it at login. Plug in your iPad and it becomes a display as soon as it's reachable over the cable, usually within about 6 seconds. Unplug it and, about 3.5 seconds later, Sidecar ends and the iPad goes to sleep. If the iPad is plugged in when you log in, including after a restart, Sidecar starts then.
 
 To remove it:
 
@@ -35,7 +35,7 @@ The LaunchAgent runs `auto-sidecar watch`. You can also run it by hand:
 auto-sidecar list          # list Sidecar-capable devices
 auto-sidecar connect       # start Sidecar once and exit
 auto-sidecar disconnect    # stop Sidecar once and exit
-auto-sidecar watch         # watch for USB iPads (what the LaunchAgent runs)
+auto-sidecar watch         # watch the USB-C ports (what the LaunchAgent runs)
 ```
 
 If you have more than one iPad, set `AUTO_SIDECAR_DEVICE` to the device name (as shown by `list`) to choose one. For the LaunchAgent, add it under `EnvironmentVariables` in `~/Library/LaunchAgents/com.kevintraver.auto-sidecar.plist`.
@@ -44,19 +44,18 @@ Logs go to `~/Library/Logs/auto-sidecar.log`.
 
 ## How it works
 
+Everything is driven by events from macOS; there are no polling loops, and only one timeout, a last-resort fallback on unplug.
+
 ### Detecting the cable
 
-IOKit matching and termination notifications fire whenever an Apple (`idVendor` 1452) `IOUSBHostDevice` appears or disappears. If its product string starts with `iPad`, that's the trigger. This is the same mechanism apps like [Stecker](https://apps.apple.com/us/app/stecker/id6447288587) use to run Shortcuts on device attach.
+The Mac's USB-C port controller reads the identity of whatever is plugged in, over USB Power Delivery. Each port is an `IOAccessoryManager` service in IOKit, and an attached iPad shows up as `SOPMfgString = "iPad"` with `ConnectionActive = Yes`. The agent registers for each port's general-interest notifications, which the kernel sends whenever the port's properties change, so it hears about a plug-in or unplug the moment it happens.
 
-On this macOS version a plain `idVendor` key in the matching dictionary matches nothing; it has to go inside `IOPropertyMatch`.
+This is more reliable than watching the USB device list (the approach apps like [Stecker](https://apps.apple.com/us/app/stecker/id6447288587) use to run Shortcuts on device attach):
 
-An iPad drops off USB and comes back while it enumerates, so every change waits 2 seconds for USB to settle before acting on whether an iPad is plugged in.
+- `ConnectionActive` changes exactly once per plug-in and once per unplug. The iPad's USB device appears, disappears, and reappears while it enumerates.
+- After a restart, macOS doesn't list an iPad that stayed plugged in as a USB device until it's replugged, but the port still reports it. So an iPad that's plugged in when the agent starts is handled like any other plug-in.
 
-### After a restart
-
-If the iPad stays plugged in while the Mac restarts, macOS doesn't list it as a USB device until it's replugged, so no plug-in event arrives. The Mac's USB-C port controller still knows what's attached, though: from USB Power Delivery, the port reports the partner's maker string (`SOPMfgString = "iPad"`). So when the agent starts within 5 minutes of boot and, 5 seconds later, no iPad is on USB but a USB-C port reports one, it starts Sidecar anyway. In testing the session still ran over the cable (`link type Direct`). No unplug event arrives for it either, so while Sidecar is on in this state, the agent checks the port once a second and runs the usual clean unplug when the iPad disappears from it.
-
-### Starting and stopping Sidecar
+### Starting Sidecar
 
 It calls the private `SidecarCore.framework`, the API behind Control Center's Screen Mirroring menu:
 
@@ -64,25 +63,25 @@ It calls the private `SidecarCore.framework`, the API behind Control Center's Sc
 - `connectToDevice:completion:` starts Sidecar
 - `disconnectFromDevice:completion:` stops it
 
-A connect can fail while the iPad is still settling, so it retries for up to 20 seconds.
+Sidecar can only run over the cable once `rapportd` has found the iPad on the cable's network link, a few seconds after plug-in. A connect sent earlier silently goes over wireless instead and takes several seconds longer. So after a plug-in the agent watches the log (`log stream`) for `rapportd`'s `Bonjour device changed ... DirectLink` and connects then. Sidecar's own device status says the same thing (bit `0x1000000`, which SidecarRelay calls `USB`, and a change is announced on the Darwin notification `user.uid.<uid>.com.apple.sidecar-relay.device-generation`). The agent also connects on that signal, but SidecarRelay often publishes the status several seconds late.
 
 ### Unplugging cleanly
 
-Disconnecting right after the cable is pulled leaves the iPad stuck on a "Connection lost" screen, and the next connect fails with an "Unable to Connect" alert on the Mac. The system logs (`log show --predicate 'process == "SidecarRelay" OR process == "rapportd"'`) show why:
+Disconnecting right after the cable is pulled leaves the iPad stuck on a "Connection lost" screen, and the next connect fails with an "Unable to Connect" alert on the Mac. The system logs (`log show --predicate 'process == "SidecarRelay" OR process == "SidecarDisplayAgent"'`) show why:
 
 1. The Sidecar session runs over the USB cable's direct network link (`link type Direct`), not regular Wi-Fi (the session is flagged `NoiWiFi`).
 2. A disconnect sent after the unplug goes out on that dead link and fails (`EADDRNOTAVAIL`), so the iPad never hears it.
-3. A few seconds after the unplug, Sidecar's video stream times out (`RTCP Timeout`; the default `rtcpTimeoutInterval` is 3 seconds), and Sidecar reconnects on its own over AWDL, Apple's direct Wi-Fi link between devices.
+3. A few seconds after the unplug, Sidecar's video stream times out (`RTCP Timeout`), and Sidecar reconnects on its own over AWDL, Apple's direct Wi-Fi link between devices.
 
-So on unplug, `auto-sidecar` waits for that wireless reconnect and then disconnects. The disconnect goes out over AWDL, the iPad receives it, and it ends the session and goes to sleep.
+So on unplug, the agent watches the log until the session is back up over wireless, and only then disconnects. The disconnect goes out over AWDL, the iPad receives it, and it ends the session and goes to sleep. Being back up means `SidecarDisplayAgent` has logged `=== Sidecar Connected ... [AWDL] ===` and then `AVCVideoStream-didStart`, once video is flowing to the iPad again. A disconnect sent between those two lines still leaves "Connection lost" on screen for a few seconds. This typically happens about 3.5 seconds after the unplug.
 
-To know when the reconnect has happened, it runs `log stream` briefly after the unplug and watches for Sidecar's `Data link type changed Unknown -> AWDL` message, then disconnects half a second later, typically about 4 seconds after the unplug. If that message never shows up (for example, if Apple rewords it), it disconnects 10 seconds after the unplug instead, which was enough in testing (the reconnect took 3–7 seconds).
+If the iPad is gone entirely (for example, unplugged while the Mac was asleep), Sidecar's reconnect fails and it logs `Reconnect Failed`; the agent disconnects right away. If neither message shows up within 10 seconds of the unplug (for example, if Apple rewords them), it disconnects anyway.
 
 None of this is documented by Apple. Other tools that use the same API: [Ocasio-J/SidecarLauncher](https://github.com/Ocasio-J/SidecarLauncher) and [sezaakgun/SidecarLauncher](https://github.com/sezaakgun/SidecarLauncher).
 
 ## Caveats
 
-`SidecarCore` is a private framework. A future macOS update could rename or change it and break this tool. The unplug handling relies on observed behavior: a log message to know when Sidecar has moved to wireless, and a 10-second fallback when that message doesn't appear. If Sidecar takes longer than that to move to wireless, the iPad may be left on "Connection lost" until it gives up on its own.
+`SidecarCore` is a private framework. A future macOS update could rename or change it and break this tool. Several signals are undocumented log messages (`rapportd`'s `DirectLink` discovery, and `SidecarDisplayAgent`'s connect, video-start and reconnect-failure lines) and a status bit, any of which Apple could change. If the plug-in signals change, Sidecar still starts once its own status catches up. If the unplug messages change, the agent falls back to disconnecting 10 seconds after the unplug. If Sidecar takes longer than that to move to wireless, the iPad may be left on "Connection lost" until it gives up on its own.
 
 ## License
 

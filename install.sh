@@ -25,5 +25,7 @@ cat > "$PLIST" <<EOF
 EOF
 
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+# bootout returns before the old agent is gone; bootstrap fails with an I/O error until it is
+while launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; do sleep 0.1; done
 launchctl bootstrap "gui/$UID" "$PLIST"
 echo "Installed. Logs: ~/Library/Logs/auto-sidecar.log"
