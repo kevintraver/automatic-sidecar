@@ -26,6 +26,7 @@
 @end
 
 typedef BOOL (^StillWanted)(void);
+static void usbChanged(void);
 
 static SidecarDisplayManager *manager(void) {
     return [NSClassFromString(@"SidecarDisplayManager") sharedManager];
@@ -77,6 +78,12 @@ static void connectSidecar(int attemptsLeft, StillWanted stillWanted, void (^don
                 return;
             }
             NSLog(@"Sidecar connected to %@", device.name);
+            if (!stillWanted()) {
+                // USB changed while connecting (e.g. unplugged mid-connect), and the newer state's handling
+                // may have already run and found nothing to disconnect. Re-evaluate now that we're connected.
+                NSLog(@"USB changed while connecting; checking again");
+                usbChanged();
+            }
             done(YES);
         });
     }];
