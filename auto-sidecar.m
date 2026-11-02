@@ -152,7 +152,12 @@ static void startLinkWatch(void) {
     task.standardOutput = pipe;
     task.standardError = [NSFileHandle fileHandleWithNullDevice];
     pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
-        NSString *output = [[NSString alloc] initWithData:handle.availableData encoding:NSUTF8StringEncoding];
+        NSData *data = handle.availableData;
+        if (data.length == 0) {  // EOF: the stream was stopped; without this the handler fires forever
+            handle.readabilityHandler = nil;
+            return;
+        }
+        NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         for (NSString *line in [output componentsSeparatedByString:@"\n"]) {
             NSRange arrow = [line rangeOfString:@"Data link type changed "];
             if (arrow.location == NSNotFound) continue;
