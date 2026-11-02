@@ -141,9 +141,11 @@ static void stopLinkWatch(void) {
     linkWatch = nil;
 }
 
+// Called on every unplug. A watch can still be running from an earlier unplug (after a quick replug),
+// so forget any wireless move seen before this unplug.
 static void startLinkWatch(void) {
-    if (linkWatch.running) return;
     sawWirelessLink = NO;
+    if (linkWatch.running) return;
     NSTask *task = [NSTask new];
     task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/log"];
     task.arguments = @[@"stream", @"--style", @"compact", @"--predicate",
@@ -153,8 +155,9 @@ static void startLinkWatch(void) {
     task.standardError = [NSFileHandle fileHandleWithNullDevice];
     pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
         NSData *data = handle.availableData;
-        if (data.length == 0) {  // EOF: the stream was stopped; without this the handler fires forever
+        if (data.length == 0) {  // EOF: the stream was stopped. Clear the handler (else it fires forever) and close the pipe (else its fd leaks).
             handle.readabilityHandler = nil;
+            [handle closeFile];
             return;
         }
         NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
@@ -256,8 +259,11 @@ static int watch(void) {
     usbDeviceAdded(NULL, added);
     drainIPads(removed);
     NSLog(@"Watching for USB iPads");
-    CFRunLoopRun();
-    return 0;
+    // Drain a pool per pass: objects Foundation autoreleases on the main thread (such as each stopped
+    // log stream's NSTask and pipe) would otherwise pile up in main's pool, which never drains.
+    for (;;) @autoreleasepool {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1e10, true);
+    }
 }
 
 int main(int argc, const char *argv[]) {
