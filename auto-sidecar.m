@@ -27,6 +27,7 @@
 
 typedef BOOL (^StillWanted)(void);
 static void usbChanged(void);
+static void stopPortWatch(void);
 
 static SidecarDisplayManager *manager(void) {
     return [NSClassFromString(@"SidecarDisplayManager") sharedManager];
@@ -238,7 +239,9 @@ static void usbChanged(void) {
 }
 
 static void usbDeviceAdded(void *refcon, io_iterator_t iterator) {
-    if (drainIPads(iterator)) usbChanged();
+    if (!drainIPads(iterator)) return;
+    stopPortWatch();  // the iPad is on USB now, so USB events cover it
+    usbChanged();
 }
 
 static void usbDeviceRemoved(void *refcon, io_iterator_t iterator) {
@@ -265,18 +268,48 @@ static BOOL iPadOnUSBCPort(void) {
 }
 
 // After a restart, macOS doesn't register an iPad that stayed plugged in as a USB device until it's
-// replugged, so no plug-in event ever arrives. Shortly after boot, if nothing has shown up on USB but a
-// USB-C port reports an iPad, start Sidecar anyway; it still runs over the cable.
-static const double kAfterBootWaitSeconds = 5;
+// replugged, so neither plug-in nor unplug events arrive for it. Shortly after startup, if nothing is on
+// USB but a USB-C port reports an iPad: start Sidecar if the Mac just booted (it still runs over the
+// cable), and while Sidecar is on, poll the port so an unplug still ends the session cleanly.
+static const double kHiddenIPadWaitSeconds = 5;
 static const double kAfterBootWindowSeconds = 300;
-static void startAfterBootFallback(void) {
-    if (NSProcessInfo.processInfo.systemUptime > kAfterBootWindowSeconds) return;
+static dispatch_source_t portWatch = nil;
+
+static void stopPortWatch(void) {
+    if (!portWatch) return;
+    dispatch_source_cancel(portWatch);
+    portWatch = nil;
+}
+
+static void startPortWatch(void) {
+    stopPortWatch();
+    portWatch = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(portWatch, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 4);
+    dispatch_source_set_event_handler(portWatch, ^{
+        if (iPadOnUSBCPort()) return;
+        stopPortWatch();
+        NSLog(@"iPad left its USB-C port");
+        startLinkWatch();
+        usbChanged();
+    });
+    dispatch_resume(portWatch);
+}
+
+static void handleIPadHiddenFromUSB(void) {
+    BOOL justBooted = NSProcessInfo.processInfo.systemUptime <= kAfterBootWindowSeconds;
     NSUInteger startGeneration = generation;
-    after(kAfterBootWaitSeconds, ^{
-        if (generation != startGeneration || iPadOnUSB() || manager().connectedDevices.count > 0) return;
-        if (!iPadOnUSBCPort()) return;
+    after(kHiddenIPadWaitSeconds, ^{
+        if (generation != startGeneration || iPadOnUSB() || !iPadOnUSBCPort()) return;
+        if (manager().connectedDevices.count > 0) {
+            NSLog(@"iPad on a USB-C port but not on USB; watching the port for an unplug");
+            startPortWatch();
+            return;
+        }
+        if (!justBooted) return;
         NSLog(@"iPad on a USB-C port but not on USB since boot; starting Sidecar");
-        connectSidecar(30, ^BOOL { return generation == startGeneration; }, ^(BOOL ok) {});
+        connectSidecar(30, ^BOOL { return generation == startGeneration; }, ^(BOOL ok) {
+            if (ok) startPortWatch();
+        });
     });
 }
 
@@ -299,7 +332,7 @@ static int watch(void) {
     usbDeviceAdded(NULL, added);
     drainIPads(removed);
     NSLog(@"Watching for USB iPads");
-    startAfterBootFallback();
+    handleIPadHiddenFromUSB();
     // Drain a pool per pass: objects Foundation autoreleases on the main thread (such as each stopped
     // log stream's NSTask and pipe) would otherwise pile up in main's pool, which never drains.
     for (;;) @autoreleasepool {
