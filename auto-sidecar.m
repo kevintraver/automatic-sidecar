@@ -247,6 +247,21 @@ static void usbDeviceRemoved(void *refcon, io_iterator_t iterator) {
     usbChanged();
 }
 
+// After a restart, macOS doesn't register an iPad that stayed plugged in as a USB device until it's
+// replugged, so no plug-in event ever arrives. Shortly after boot, if no iPad has shown up on USB and
+// nothing has changed, start Sidecar anyway; it connects wirelessly.
+static const double kAfterBootWaitSeconds = 30;
+static const double kAfterBootWindowSeconds = 300;
+static void startAfterBootFallback(void) {
+    if (NSProcessInfo.processInfo.systemUptime > kAfterBootWindowSeconds) return;
+    NSUInteger startGeneration = generation;
+    after(kAfterBootWaitSeconds, ^{
+        if (generation != startGeneration || iPadOnUSB() || manager().connectedDevices.count > 0) return;
+        NSLog(@"No iPad on USB since boot; starting Sidecar wirelessly");
+        connectSidecar(30, ^BOOL { return generation == startGeneration; }, ^(BOOL ok) {});
+    });
+}
+
 static int watch(void) {
     IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault);
     CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
@@ -266,6 +281,7 @@ static int watch(void) {
     usbDeviceAdded(NULL, added);
     drainIPads(removed);
     NSLog(@"Watching for USB iPads");
+    startAfterBootFallback();
     // Drain a pool per pass: objects Foundation autoreleases on the main thread (such as each stopped
     // log stream's NSTask and pipe) would otherwise pile up in main's pool, which never drains.
     for (;;) @autoreleasepool {
