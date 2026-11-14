@@ -75,7 +75,9 @@ Disconnecting right after the cable is pulled leaves the iPad stuck on a "Connec
 
 So on unplug, the agent watches the log until the session is back up over wireless, and only then disconnects. The disconnect goes out over AWDL, the iPad receives it, and it ends the session and goes to sleep. Being back up means `SidecarDisplayAgent` has logged `=== Sidecar Connected ... [AWDL] ===` and then `AVCVideoStream-didStart`, once video is flowing to the iPad again. A disconnect sent between those two lines still leaves "Connection lost" on screen for a few seconds. This typically happens about 3.5 seconds after the unplug.
 
-If the iPad is gone entirely (for example, unplugged while the Mac was asleep), Sidecar's reconnect fails and it logs `Reconnect Failed`; the agent disconnects right away. If neither message shows up within 10 seconds of the unplug (for example, if Apple rewords them), it disconnects anyway.
+If the iPad is gone entirely (for example, unplugged while the Mac was asleep), Sidecar's reconnect fails and it logs `Reconnect Failed`; the agent disconnects right away. If none of these messages shows up within 10 seconds of the unplug (for example, if Apple rewords them), it disconnects anyway.
+
+While the Mac's display is asleep, Sidecar pauses the session. When the display wakes, it logs `=== Display Wake: Reconnecting ===` and tries to resume over the cable; if the cable is gone, it gives up 10 seconds later with an error alert on the Mac. A paused session has no video on the iPad to leave on "Connection lost", so if the display is asleep at unplug (checked with `CGDisplayIsAsleep`), or Sidecar starts resuming after one, the agent disconnects right away. Disconnecting a session that isn't running skips Sidecar's cleanup, including the Darwin notification Control Center refreshes its Screen Mirroring icon on, which would otherwise stay lit. So after every unplug the agent posts that notification itself.
 
 None of this is documented by Apple. Other tools that use the same API: [Ocasio-J/SidecarLauncher](https://github.com/Ocasio-J/SidecarLauncher) and [sezaakgun/SidecarLauncher](https://github.com/sezaakgun/SidecarLauncher).
 

@@ -9,6 +9,7 @@
 
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include <dlfcn.h>
 #include <notify.h>
 
@@ -44,6 +45,11 @@ static SidecarDevice *targetDevice(void) {
 
 static void after(double seconds, dispatch_block_t block) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), dispatch_get_main_queue(), block);
+}
+
+// Posted by SidecarRelay whenever a device's status changes; Sidecar clients, Control Center among them, refetch on it.
+static NSString *deviceGenerationNotification(void) {
+    return [NSString stringWithFormat:@"user.uid.%d.com.apple.sidecar-relay.device-generation", getuid()];
 }
 
 static void disconnectSidecar(void (^done)(void)) {
@@ -90,6 +96,14 @@ static BOOL iPadOnUSBCPort(void) {
 // restarts still leaves "Connection lost" on screen for a few seconds; one sent after it puts the iPad
 // straight to sleep. If the iPad is gone entirely (for example, unplugged while the Mac slept), the
 // reconnect fails instead and Sidecar logs "Reconnect Failed". Watch for these, briefly.
+//
+// While the Mac's display sleeps, Sidecar pauses its session. When the display wakes it logs
+// "=== Display Wake: Reconnecting ===" and resumes on the link it had; if that was the unplugged cable,
+// it gives up 10 s later (SidecarErrorDomain -201) with an alert on the Mac. A paused session has no video
+// to strand on the iPad, so an unplug while the display sleeps, or a resume after one, disconnects right away.
+// Disconnecting a session that isn't running skips Sidecar's cleanup, including the device-generation
+// notification Control Center refreshes its menu bar icon on, so the agent posts that itself.
+//
 // Runs `log stream` with a predicate, stores it in *slot, and hands each real entry (not log stream's own
 // header, which repeats the predicate) to the handler on the main queue while *slot still holds it.
 static void startLogWatch(NSTask *__strong *slot, NSString *process, NSString *predicate, void (^onLine)(NSString *line)) {
@@ -142,9 +156,10 @@ static void startSessionWatch(void (^onReady)(NSString *reason)) {
     __block BOOL onWireless = NO;
     startLogWatch(&sessionWatch, @"SidecarDisplayAgent",
         @"eventMessage CONTAINS \"=== Sidecar Connected\" OR eventMessage CONTAINS \"AVCVideoStream-didStart\" OR "
-         "eventMessage CONTAINS \"Reconnect Failed\"",
+         "eventMessage CONTAINS \"Reconnect Failed\" OR eventMessage CONTAINS \"=== Display Wake: Reconnecting\"",
         ^(NSString *line) {
             if ([line containsString:@"Reconnect Failed"]) onReady(@"Sidecar could not reconnect");
+            else if ([line containsString:@"Display Wake: Reconnecting"]) onReady(@"Sidecar is resuming over the unplugged cable");
             else if ([line containsString:@"=== Sidecar Connected"]) onWireless = ![line containsString:@"[Direct]"];
             else if (onWireless && [line containsString:@"AVCVideoStream-didStart"]) onReady(@"Sidecar moved to wireless");
         });
@@ -206,8 +221,12 @@ static void handleUnplug(void) {
         ++unplugGeneration;
         NSLog(@"%@; disconnecting", reason);
         stopSessionWatch();
-        disconnectSidecar(^{});
+        disconnectSidecar(^{ notify_post(deviceGenerationNotification().UTF8String); });
     };
+    if (CGDisplayIsAsleep(CGMainDisplayID())) {
+        finish(@"Mac display is asleep, so Sidecar is paused");
+        return;
+    }
     startSessionWatch(finish);
     after(kUnplugFallbackSeconds, ^{ finish(@"Did not see Sidecar move to wireless"); });
 }
@@ -264,9 +283,8 @@ static int watch(void) {
     IOObjectRelease(ports);
 
     // SidecarRelay bumps this whenever a device's status changes, such as the iPad becoming reachable over USB.
-    NSString *deviceGeneration = [NSString stringWithFormat:@"user.uid.%d.com.apple.sidecar-relay.device-generation", getuid()];
     int token;
-    notify_register_dispatch(deviceGeneration.UTF8String, &token, dispatch_get_main_queue(), ^(int t) { tryConnect(); });
+    notify_register_dispatch(deviceGenerationNotification().UTF8String, &token, dispatch_get_main_queue(), ^(int t) { tryConnect(); });
 
     NSLog(@"Watching for an iPad on USB-C");
     portsChanged();  // an iPad already plugged in, including after a restart

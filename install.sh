@@ -8,7 +8,7 @@ LABEL="com.kevintraver.auto-sidecar"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 mkdir -p "${BIN:h}" "${PLIST:h}"
-clang -fobjc-arc -O2 -framework Foundation -framework IOKit auto-sidecar.m -o "$BIN"
+clang -fobjc-arc -O2 -framework Foundation -framework IOKit -framework CoreGraphics auto-sidecar.m -o "$BIN"
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
