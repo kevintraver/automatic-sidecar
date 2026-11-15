@@ -52,6 +52,21 @@ static NSString *deviceGenerationNotification(void) {
     return [NSString stringWithFormat:@"user.uid.%d.com.apple.sidecar-relay.device-generation", getuid()];
 }
 
+// SidecarDisplayAgent publishes its sessions' state as the Darwin notification state of this name,
+// (its PID << 32) | a counter. Sidecar clients such as Control Center cache the connected devices until it
+// changes. Flipping the top bit, which the agent never sets, always gives a value that differs both from
+// the current one and from whatever the agent sets next.
+static void clearStaleConnection(void) {
+    NSString *name = [NSString stringWithFormat:@"user.uid.%d.com.apple.sidecar-display-agent.connection-generation", getuid()];
+    int token;
+    if (notify_register_check(name.UTF8String, &token) != NOTIFY_STATUS_OK) return;
+    uint64_t state = 0;
+    notify_get_state(token, &state);
+    notify_set_state(token, state ^ (1ULL << 63));
+    notify_cancel(token);
+    notify_post(name.UTF8String);
+}
+
 static void disconnectSidecar(void (^done)(void)) {
     NSArray<SidecarDevice *> *connected = manager().connectedDevices;
     if (connected.count == 0) {
@@ -101,8 +116,9 @@ static BOOL iPadOnUSBCPort(void) {
 // "=== Display Wake: Reconnecting ===" and resumes on the link it had; if that was the unplugged cable,
 // it gives up 10 s later (SidecarErrorDomain -201) with an alert on the Mac. A paused session has no video
 // to strand on the iPad, so an unplug while the display sleeps, or a resume after one, disconnects right away.
-// Disconnecting a session that isn't running skips Sidecar's cleanup, including the device-generation
-// notification Control Center refreshes its menu bar icon on, so the agent posts that itself.
+// Disconnecting a session that isn't running skips Sidecar's cleanup, including the change to the
+// connection-generation state that Control Center rereads Sidecar's connected devices on, so its Screen
+// Mirroring icon would stay lit. The agent changes that state itself (see clearStaleConnection).
 //
 // Runs `log stream` with a predicate, stores it in *slot, and hands each real entry (not log stream's own
 // header, which repeats the predicate) to the handler on the main queue while *slot still holds it.
@@ -221,7 +237,7 @@ static void handleUnplug(void) {
         ++unplugGeneration;
         NSLog(@"%@; disconnecting", reason);
         stopSessionWatch();
-        disconnectSidecar(^{ notify_post(deviceGenerationNotification().UTF8String); });
+        disconnectSidecar(^{ clearStaleConnection(); });
     };
     if (CGDisplayIsAsleep(CGMainDisplayID())) {
         finish(@"Mac display is asleep, so Sidecar is paused");
