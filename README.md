@@ -44,7 +44,7 @@ Logs go to `~/Library/Logs/auto-sidecar.log`.
 
 ## How it works
 
-Everything is driven by events from macOS; there are no polling loops, and only one timeout, a last-resort fallback on unplug.
+Everything is driven by events from macOS. There are no polling loops, and only two timers: a retry after a failed connect, and a last-resort fallback on unplug.
 
 ### Detecting the cable
 
@@ -64,6 +64,8 @@ It calls the private `SidecarCore.framework`, the API behind Control Center's Sc
 - `disconnectFromDevice:completion:` stops it
 
 Sidecar can only run over the cable once `rapportd` has found the iPad on the cable's network link, a few seconds after plug-in. A connect sent earlier silently goes over wireless instead and takes several seconds longer. So after a plug-in the agent watches the log (`log stream`) for `rapportd`'s `Bonjour device changed ... DirectLink` and connects then. Sidecar's own device status says the same thing (bit `0x1000000`, which SidecarRelay calls `USB`, and a change is announced on the Darwin notification `user.uid.<uid>.com.apple.sidecar-relay.device-generation`). The agent also connects on that signal, but SidecarRelay often publishes the status several seconds late.
+
+If the iPad doesn't answer (for example, while it's still waking up), the connect times out after 10 seconds with an alert on the Mac. The agent tries again on the next change to the iPad's status, or 5 seconds later if none comes first, up to 3 attempts per plug-in.
 
 ### Unplugging cleanly
 

@@ -187,6 +187,7 @@ static BOOL connecting = NO;
 static BOOL directLinkUp = NO;  // rapportd has found the iPad over the cable since it was plugged in
 static int connectFailures = 0;
 static const int kMaxConnectFailures = 3;
+static const double kConnectRetrySeconds = 5;  // after a failed connect, if no device change comes first
 static NSUInteger unplugGeneration = 0;  // bumped to cancel a pending unplug
 static const double kUnplugFallbackSeconds = 10;  // if neither log line shows up
 
@@ -195,7 +196,9 @@ static void handleUnplug(void);
 // Connect once the iPad is reachable over the cable: rapportd logs "Bonjour device changed ... DirectLink"
 // when it finds the iPad on the cable's network link. Sidecar's own USB flag says the same, but SidecarRelay
 // publishes it to clients several seconds late. Called on plug-in, on that log line, and on every change to
-// Sidecar's device list, so there's nothing to poll or retry on a timer.
+// Sidecar's device list. A connect can still time out if the iPad doesn't answer (SidecarErrorDomain -201,
+// e.g. while it is still waking), and nothing may change on the iPad's side afterward, so a failed connect
+// also tries again after kConnectRetrySeconds. Calling this when there's nothing to do is harmless.
 static void tryConnect(void) {
     if (!wantConnect || connecting) return;
     if (manager().connectedDevices.count > 0) {
@@ -217,8 +220,10 @@ static void tryConnect(void) {
                     NSLog(@"Giving up on connecting Sidecar");
                     wantConnect = NO;
                     stopDirectLinkWatch();
+                } else {
+                    after(kConnectRetrySeconds, ^{ tryConnect(); });  // or sooner, on a device change
                 }
-                return;  // tried again on the next device change
+                return;
             }
             NSLog(@"Sidecar connected to %@", device.name);
             wantConnect = NO;
